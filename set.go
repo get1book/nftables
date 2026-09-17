@@ -271,6 +271,29 @@ type Set struct {
 	Comment      string
 	// Indicates that the set has "size" specifier
 	Size uint32
+
+	// ---- nfapi fork: nft private udata. Zero values write no TLV, keeping the
+	// wire format byte-for-byte identical to upstream. ----
+
+	// KeyTypeofExpr is the binary KEY_TYPEOF payload passed through verbatim.
+	// It must be the inner TLV list nft produces in set_key_expression:
+	//   TYPEOF_EXPR (u32 expr->etype) + TYPEOF_DATA (nested, expr build_udata).
+	// The library assigns no expression semantics to it. nil = no TLV written.
+	// See https://git.netfilter.org/nftables/tree/src/mnl.c (set_key_expression).
+	KeyTypeofExpr []byte
+
+	// DataByteOrder declares the value-side byte order for maps
+	// (NFTNL_UDATA_SET_DATABYTEORDER). It depends on the value datatype alone
+	// (host -> NativeEndian, network -> BigEndian), never on
+	// Anonymous/Constant/Interval. nil = no TLV written.
+	DataByteOrder binaryutil.ByteOrder
+
+	// KeyByteOrderExplicit, when true, makes AddSet declare
+	// NFTNL_UDATA_SET_KEYBYTEORDER purely from the key datatype
+	// (concat -> 0, host order -> 1, network order -> 2), bypassing the
+	// historical Anonymous||Constant||Interval short-circuit that always wrote 2.
+	// Leave false for upstream-identical behaviour.
+	KeyByteOrderExplicit bool
 }
 
 // SetElement represents a data point within a set.
@@ -716,12 +739,36 @@ func (cc *Conn) AddSet(s *Set, vals []SetElement) error {
 	// https://git.netfilter.org/libnftnl/tree/include/udata.h#n17
 	var userData []byte
 
-	if s.Anonymous || s.Constant || s.Interval || s.KeyByteOrder == binaryutil.BigEndian {
+	switch {
+	case s.KeyByteOrderExplicit:
+		// Declared purely from the datatype: concat is 0, host order is 1 and
+		// network order is 2. Deliberately no Anonymous/Constant/Interval special
+		// case here - nft derives the value from the datatype alone.
+		order := uint32(2)
+		if s.Concatenation {
+			order = 0
+		} else if s.KeyByteOrder == binaryutil.NativeEndian {
+			order = 1
+		}
+		userData = userdata.AppendUint32(userData, userdata.NFTNL_UDATA_SET_KEYBYTEORDER, order)
+	case s.Anonymous || s.Constant || s.Interval || s.KeyByteOrder == binaryutil.BigEndian:
 		// Semantically useless - kept for binary compatability with nft
 		userData = userdata.AppendUint32(userData, userdata.NFTNL_UDATA_SET_KEYBYTEORDER, 2)
-	} else if s.KeyByteOrder == binaryutil.NativeEndian {
+	case s.KeyByteOrder == binaryutil.NativeEndian:
 		// Per https://git.netfilter.org/nftables/tree/src/mnl.c?id=187c6d01d35722618c2711bbc49262c286472c8f#n1165
 		userData = userdata.AppendUint32(userData, userdata.NFTNL_UDATA_SET_KEYBYTEORDER, 1)
+	}
+
+	// Value-side byte order (maps only, mirroring nft's set_is_datamap branch).
+	// It depends on the value datatype alone and must NOT reuse the
+	// Anonymous/Constant/Interval short-circuit above.
+	if s.IsMap {
+		switch s.DataByteOrder {
+		case binaryutil.NativeEndian:
+			userData = userdata.AppendUint32(userData, userdata.NFTNL_UDATA_SET_DATABYTEORDER, 1)
+		case binaryutil.BigEndian:
+			userData = userdata.AppendUint32(userData, userdata.NFTNL_UDATA_SET_DATABYTEORDER, 2)
+		}
 	}
 
 	if s.Interval && s.AutoMerge {
@@ -731,6 +778,18 @@ func (cc *Conn) AddSet(s *Set, vals []SetElement) error {
 
 	if s.DataInterval {
 		userData = userdata.AppendUint32(userData, userdata.NFTNL_UDATA_SET_DATA_INTERVAL, 1)
+	}
+
+	// KEY_TYPEOF: caller-built binary payload, passed through verbatim. nft's udata
+	// length is a single byte, so refuse oversized payloads rather than silently
+	// truncating the length (see userdata.Append).
+	if len(s.KeyTypeofExpr) > 0 {
+		if len(s.KeyTypeofExpr) > 255 {
+			err := fmt.Errorf("nftables: KeyTypeofExpr is %d bytes, exceeds the 255-byte udata limit", len(s.KeyTypeofExpr))
+			cc.setErr(err)
+			return err
+		}
+		userData = userdata.Append(userData, userdata.NFTNL_UDATA_SET_KEY_TYPEOF, s.KeyTypeofExpr)
 	}
 
 	if len(s.Comment) != 0 {
@@ -871,6 +930,15 @@ func setsFromMsg(msg netlink.Message) (*Set, error) {
 			if val, ok := userdata.GetUint32(data, userdata.NFTNL_UDATA_SET_DATA_INTERVAL); ok {
 				set.DataInterval = val == 1
 			}
+			if val, ok := userdata.GetUint32(data, userdata.NFTNL_UDATA_SET_KEYBYTEORDER); ok {
+				set.KeyByteOrder = byteOrderOfTLV(val)
+			}
+			if val, ok := userdata.GetUint32(data, userdata.NFTNL_UDATA_SET_DATABYTEORDER); ok {
+				set.DataByteOrder = byteOrderOfTLV(val)
+			}
+			if val := userdata.Get(data, userdata.NFTNL_UDATA_SET_KEY_TYPEOF); val != nil {
+				set.KeyTypeofExpr = append([]byte(nil), val...)
+			}
 
 		case unix.NFTA_SET_DESC:
 			nestedAD, err := netlink.NewAttributeDecoder(ad.Bytes())
@@ -889,6 +957,19 @@ func setsFromMsg(msg netlink.Message) (*Set, error) {
 		}
 	}
 	return &set, nil
+}
+
+// byteOrderOfTLV maps an nft udata byte-order value back to a ByteOrder.
+// nft writes 1 for host order and 2 for big order; 0 (used by concat) and any
+// other value map to nil, meaning "unspecified".
+func byteOrderOfTLV(v uint32) binaryutil.ByteOrder {
+	switch v {
+	case 1:
+		return binaryutil.NativeEndian
+	case 2:
+		return binaryutil.BigEndian
+	}
+	return nil
 }
 
 func parseSetDatatype(magic uint32) (SetDatatype, error) {
