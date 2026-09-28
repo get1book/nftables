@@ -46,6 +46,11 @@ const (
 	ObjTypeSynProxy  ObjType = unix.NFT_OBJECT_SYNPROXY
 )
 
+// x/sys 还没导出 NFTA_OBJ_USERDATA，取值来自内核头文件
+// include/uapi/linux/netfilter/nf_tables.h 的 nfta_obj_attributes
+// （UNSPEC=0 … HANDLE=6、PAD=7、USERDATA=8）。
+const nftaObjUserData = 8
+
 var objByObjTypeMagic = map[ObjType]string{
 	ObjTypeCounter:   "counter",
 	ObjTypeQuota:     "quota",
@@ -77,6 +82,10 @@ type NamedObj struct {
 	Name  string
 	Type  ObjType
 	Obj   expr.Any
+	// UserData 保存 NFTA_OBJ_USERDATA 的原始 TLV，nft 用它承载
+	// `{ comment "..." }`。读写都用 userdata 包：
+	// userdata.GetString(o.UserData, userdata.NFTNL_UDATA_OBJ_COMMENT)。
+	UserData []byte
 }
 
 func (o *NamedObj) table() *Table {
@@ -122,6 +131,10 @@ func (cc *Conn) AddObj(o Obj) Obj {
 	}
 	if len(data) > 0 {
 		attrs = append(attrs, netlink.Attribute{Type: unix.NLA_F_NESTED | unix.NFTA_OBJ_DATA, Data: data})
+	}
+	// 只有 NamedObj 能带 userdata；空值不写属性，保持与上游逐字节一致。
+	if no, ok := o.(*NamedObj); ok && len(no.UserData) > 0 {
+		attrs = append(attrs, netlink.Attribute{Type: nftaObjUserData, Data: no.UserData})
 	}
 
 	cc.messages = append(cc.messages, netlinkMessage{
@@ -240,6 +253,9 @@ func objFromMsg(msg netlink.Message, returnLegacyType bool) (Obj, error) {
 		table      *Table
 		name       string
 		objectType uint32
+		userData   []byte
+		legacy     Obj
+		obj        expr.Any
 	)
 	for ad.Next() {
 		switch ad.Type() {
@@ -249,9 +265,18 @@ func objFromMsg(msg netlink.Message, returnLegacyType bool) (Obj, error) {
 			name = ad.String()
 		case unix.NFTA_OBJ_TYPE:
 			objectType = ad.Uint32()
+		case nftaObjUserData:
+			// 内核把 USERDATA 排在 DATA 之后，所以这里只能先攒着，
+			// 等循环结束再一起返回（旧实现在 DATA 分支直接 return，会丢掉它）。
+			userData = ad.Bytes()
 		case unix.NFTA_OBJ_DATA:
 			if returnLegacyType {
-				return objDataFromMsgLegacy(ad, table, name, objectType)
+				o, err := objDataFromMsgLegacy(ad, table, name, objectType)
+				if err != nil {
+					return nil, err
+				}
+				legacy = o
+				continue
 			}
 
 			o := NamedObj{
@@ -267,17 +292,23 @@ func objFromMsg(msg netlink.Message, returnLegacyType bool) (Obj, error) {
 			if len(objs) == 0 {
 				return nil, fmt.Errorf("objFromMsg: objs is empty for obj %v", o)
 			}
-			exprs := make([]expr.Any, len(objs))
-			for i := range exprs {
-				exprs[i] = objs[i].(expr.Any)
-			}
-
-			o.Obj = exprs[0]
-			return &o, ad.Err()
+			obj = objs[0].(expr.Any)
 		}
 	}
 	if err := ad.Err(); err != nil {
 		return nil, err
+	}
+	if legacy != nil {
+		return legacy, nil
+	}
+	if obj != nil {
+		return &NamedObj{
+			Table:    table,
+			Name:     name,
+			Type:     ObjType(objectType),
+			Obj:      obj,
+			UserData: userData,
+		}, nil
 	}
 	return nil, fmt.Errorf("malformed stateful object")
 }

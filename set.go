@@ -62,6 +62,19 @@ func (s *SetDatatype) GetNFTMagic() uint32 {
 	return s.nftMagic
 }
 
+// IntegerTypeOf returns the generic integer datatype with the given byte width.
+//
+// nft calls every width of the generic integer "integer" (datatype id 4); only the
+// byte length differs. Getting the length wrong is not cosmetic: when a map declares
+// its value via `typeof <expr>`, nft reconstructs the expression from the
+// DATA_TYPEOF udata and cross-checks it against NFTA_SET_DATA_LEN. Declaring a
+// 16-bit expression such as `ct zone` with the 4-byte TypeInteger makes that
+// reconstruction fail, and nft silently falls back to rendering `type ... : 0`
+// instead of `typeof ...`.
+func IntegerTypeOf(bytes uint32) SetDatatype {
+	return SetDatatype{Name: TypeInteger.Name, Bytes: bytes, nftMagic: TypeInteger.nftMagic}
+}
+
 // SetNFTMagic returns a custom datatype based on user's parameters
 func (s *SetDatatype) SetNFTMagic(nftMagic uint32) {
 	s.nftMagic = nftMagic
@@ -282,6 +295,12 @@ type Set struct {
 	// See https://git.netfilter.org/nftables/tree/src/mnl.c (set_key_expression).
 	KeyTypeofExpr []byte
 
+	// DataTypeofExpr is the binary DATA_TYPEOF payload passed through verbatim,
+	// the value-side sibling of KeyTypeofExpr (used for `map x { typeof ... : <expr> }`).
+	// Same format as KeyTypeofExpr. nil = no TLV written. Only meaningful for maps;
+	// for plain sets the caller should leave it nil.
+	DataTypeofExpr []byte
+
 	// DataByteOrder declares the value-side byte order for maps
 	// (NFTNL_UDATA_SET_DATABYTEORDER). It depends on the value datatype alone
 	// (host -> NativeEndian, network -> BigEndian), never on
@@ -294,6 +313,16 @@ type Set struct {
 	// historical Anonymous||Constant||Interval short-circuit that always wrote 2.
 	// Leave false for upstream-identical behaviour.
 	KeyByteOrderExplicit bool
+
+	// ObjType marks the set as an object map (NFT_SET_OBJECT): its "value" is a
+	// reference to a named stateful object (counter / quota) rather than a data
+	// type. When non-zero the library sets NFT_SET_OBJECT, writes
+	// NFTA_SET_OBJ_TYPE, and writes neither NFTA_SET_DATA_TYPE nor
+	// NFTA_SET_DATA_LEN — byte-for-byte what nft 1.1.7 emits for
+	// "add map t ports { type inet_service : counter ; }" (verified with strace
+	// against kernel 7.2.6). Note NFT_SET_MAP is deliberately *not* set here,
+	// matching nft (observed flags == 0x40 only). Zero = ordinary set/map.
+	ObjType ObjType
 }
 
 // SetElement represents a data point within a set.
@@ -318,6 +347,12 @@ type SetElement struct {
 	Comment string
 	// Indicates an unbounded interval [start, ∞) with no end element.
 	IntervalOpen bool
+
+	// ObjRef names a stateful object (counter / quota) and is how an object map
+	// stores its value: NFTA_SET_ELEM_OBJREF (a plain NLA_STRING), emitted
+	// instead of NFTA_SET_ELEM_DATA. Only meaningful when the owning Set has
+	// ObjType set. Empty = ordinary set/map element.
+	ObjRef string
 }
 
 func (s *SetElement) decode(fam byte) func(b []byte) error {
@@ -345,6 +380,9 @@ func (s *SetElement) decode(fam byte) func(b []byte) error {
 				if err != nil {
 					return err
 				}
+			case unix.NFTA_SET_ELEM_OBJREF:
+				// 对象映射：值就是对象名，内核以 NLA_STRING（含结尾 NUL）回传。
+				s.ObjRef = strings.TrimRight(string(ad.Bytes()), "\x00")
 			case unix.NFTA_SET_ELEM_FLAGS:
 				flags := ad.Uint32()
 				s.IntervalEnd = (flags & unix.NFT_SET_ELEM_INTERVAL_END) != 0
@@ -532,6 +570,10 @@ func (cc *Conn) marshalSetElement(s *Set, e *SetElement) ([]byte, error) {
 	// 2. v is an element of a regular map
 	// 3. v is an element of a regular set (default)
 	switch {
+	case e.ObjRef != "":
+		// 对象映射的值是「具名对象引用」（NLA_STRING），不是嵌套 nft_data：
+		// 此时不发 NFTA_SET_ELEM_DATA（实测 nft 1.1.7 的报文即如此）。
+		item = append(item, netlink.Attribute{Type: unix.NFTA_SET_ELEM_OBJREF, Data: []byte(e.ObjRef + "\x00")})
 	case e.VerdictData != nil:
 		// Since VerdictData is not nil, v is vmap element, need to add to the attributes
 		encodedVal := []byte{}
@@ -630,8 +672,12 @@ func (cc *Conn) AddSet(s *Set, vals []SetElement) error {
 	if s.Interval {
 		flags |= unix.NFT_SET_INTERVAL
 	}
-	if s.IsMap {
+	// An object map is not a data map: nft sets only NFT_SET_OBJECT.
+	if s.IsMap && s.ObjType == 0 {
 		flags |= unix.NFT_SET_MAP
+	}
+	if s.ObjType != 0 {
+		flags |= unix.NFT_SET_OBJECT
 	}
 	if s.HasTimeout {
 		flags |= unix.NFT_SET_TIMEOUT
@@ -650,7 +696,12 @@ func (cc *Conn) AddSet(s *Set, vals []SetElement) error {
 		{Type: unix.NFTA_SET_KEY_LEN, Data: binaryutil.BigEndian.PutUint32(s.KeyType.Bytes)},
 		{Type: unix.NFTA_SET_ID, Data: binaryutil.BigEndian.PutUint32(s.ID)},
 	}
-	if s.IsMap {
+	// Object maps carry no DATA_TYPE / DATA_LEN: the value is implied by
+	// NFTA_SET_OBJ_TYPE and supplied per element as NFTA_SET_ELEM_OBJREF.
+	if s.ObjType != 0 {
+		tableInfo = append(tableInfo, netlink.Attribute{Type: unix.NFTA_SET_OBJ_TYPE, Data: binaryutil.BigEndian.PutUint32(uint32(s.ObjType))})
+	}
+	if s.IsMap && s.ObjType == 0 {
 		// Check if it is vmap case
 		if s.DataType.nftMagic == 1 {
 			// For Verdict data type, the expected magic is 0xffffff00
@@ -792,6 +843,17 @@ func (cc *Conn) AddSet(s *Set, vals []SetElement) error {
 		userData = userdata.Append(userData, userdata.NFTNL_UDATA_SET_KEY_TYPEOF, s.KeyTypeofExpr)
 	}
 
+	// DATA_TYPEOF: value-side sibling of KEY_TYPEOF (map value typeof). Same
+	// pass-through / size-guard policy.
+	if len(s.DataTypeofExpr) > 0 {
+		if len(s.DataTypeofExpr) > 255 {
+			err := fmt.Errorf("nftables: DataTypeofExpr is %d bytes, exceeds the 255-byte udata limit", len(s.DataTypeofExpr))
+			cc.setErr(err)
+			return err
+		}
+		userData = userdata.Append(userData, userdata.NFTNL_UDATA_SET_DATA_TYPEOF, s.DataTypeofExpr)
+	}
+
 	if len(s.Comment) != 0 {
 		userData = userdata.AppendString(userData, userdata.NFTNL_UDATA_SET_COMMENT, s.Comment)
 	}
@@ -904,6 +966,9 @@ func setsFromMsg(msg netlink.Message) (*Set, error) {
 				return nil, fmt.Errorf("could not determine data type: %w", err)
 			}
 			set.KeyType = dt
+		case unix.NFTA_SET_OBJ_TYPE:
+			// 对象映射：值类型由 OBJ_TYPE 单独承载（此时内核不发 DATA_TYPE / DATA_LEN）。
+			set.ObjType = ObjType(ad.Uint32())
 		case unix.NFTA_SET_KEY_LEN:
 			set.KeyType.Bytes = binary.BigEndian.Uint32(ad.Bytes())
 		case unix.NFTA_SET_DATA_TYPE:
@@ -938,6 +1003,9 @@ func setsFromMsg(msg netlink.Message) (*Set, error) {
 			}
 			if val := userdata.Get(data, userdata.NFTNL_UDATA_SET_KEY_TYPEOF); val != nil {
 				set.KeyTypeofExpr = append([]byte(nil), val...)
+			}
+			if val := userdata.Get(data, userdata.NFTNL_UDATA_SET_DATA_TYPEOF); val != nil {
+				set.DataTypeofExpr = append([]byte(nil), val...)
 			}
 
 		case unix.NFTA_SET_DESC:

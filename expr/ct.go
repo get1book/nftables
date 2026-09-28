@@ -369,18 +369,27 @@ func (c *CtTimeout) marshal(fam byte) ([]byte, error) {
 	})
 }
 
-func (c *CtTimeout) marshalData(fam byte) ([]byte, error) {
-	var policy CtStatePolicyTimeout
-	switch c.L4Proto {
-	case unix.IPPROTO_UDP:
-		policy = CtStateUDPTimeoutDefaults
-	default:
-		policy = CtStateTCPTimeoutDefaults
+// policyOrDefault 返回「该 l4proto 的默认策略 + c.Policy 覆盖」的新 map。
+//
+// 必须复制：CtState*TimeoutDefaults 是包级共享的 map，直接把它赋给局部变量再写入
+// 会永久污染默认值——同一进程里此后创建的每个 ct timeout 对象都会带上这一次的值。
+func (c *CtTimeout) policyOrDefault() CtStatePolicyTimeout {
+	defaults := CtStateTCPTimeoutDefaults
+	if c.L4Proto == unix.IPPROTO_UDP {
+		defaults = CtStateUDPTimeoutDefaults
 	}
-
+	policy := make(CtStatePolicyTimeout, len(defaults)+len(c.Policy))
+	for k, v := range defaults {
+		policy[k] = v
+	}
 	for k, v := range c.Policy {
 		policy[k] = v
 	}
+	return policy
+}
+
+func (c *CtTimeout) marshalData(fam byte) ([]byte, error) {
+	policy := c.policyOrDefault()
 
 	var policyAttrs []netlink.Attribute
 	for k, v := range policy {
@@ -418,13 +427,10 @@ func (c *CtTimeout) unmarshal(fam byte, data []byte) error {
 			if err != nil {
 				return err
 			}
+			// 先按默认策略铺一份，再用内核回读的值覆盖（policyOrDefault 会复制，
+			// 不会写到包级默认表上）。
+			c.Policy = c.policyOrDefault()
 			for decoder.Next() {
-				switch c.L4Proto {
-				case unix.IPPROTO_UDP:
-					c.Policy = CtStateUDPTimeoutDefaults
-				default:
-					c.Policy = CtStateTCPTimeoutDefaults
-				}
 				c.Policy[decoder.Type()-1] = decoder.Uint32()
 			}
 		}

@@ -137,6 +137,52 @@ func TestAddSetKeyTypeofAndDataByteOrder(t *testing.T) {
 	}
 }
 
+// dataTypeofCTZone is a real DATA_TYPEOF payload for `typeof ... : ct zone`,
+// captured from nft 1.1.7 via nfapi's internal/typeof encoder:
+// EXPR_CT=12, CT_KEY=NFT_CT_ZONE(17), CT_DIR=0xffffffff.
+var dataTypeofCTZone = []byte{
+	0x00, 0x04, 0x0c, 0x00, 0x00, 0x00, // TYPEOF_EXPR = EXPR_CT (12)
+	0x01, 0x0c, // TYPEOF_DATA (nested), len 12
+	0x00, 0x04, 0x11, 0x00, 0x00, 0x00, // CT_KEY = NFT_CT_ZONE (17)
+	0x01, 0x04, 0xff, 0xff, 0xff, 0xff, // CT_DIR = 0xffffffff
+}
+
+// TestAddSetDataTypeof checks DATA_TYPEOF passthrough and round-trip, the
+// value-side sibling of TestAddSetKeyTypeofAndDataByteOrder.
+func TestAddSetDataTypeof(t *testing.T) {
+	t.Parallel()
+	c := newTestConn(t)
+	set := &Set{
+		Name:           "sdt",
+		ID:             1,
+		Table:          &Table{Name: "t", Family: TableFamilyIPv4},
+		KeyType:        TypeIPAddr,
+		IsMap:          true,
+		DataType:       TypeInteger,
+		DataTypeofExpr: dataTypeofCTZone,
+	}
+	if err := c.AddSet(set, nil); err != nil {
+		t.Fatal(err)
+	}
+	ud := rawUserdata(t, c.messages[len(c.messages)-1])
+
+	if got := userdata.Get(ud, userdata.NFTNL_UDATA_SET_DATA_TYPEOF); !bytes.Equal(got, dataTypeofCTZone) {
+		t.Errorf("DATA_TYPEOF = % x, want % x", got, dataTypeofCTZone)
+	}
+
+	// Read side must recover the same value.
+	nset, err := setsFromMsg(netlink.Message{
+		Header: c.messages[len(c.messages)-1].Header,
+		Data:   c.messages[len(c.messages)-1].Data,
+	})
+	if err != nil {
+		t.Fatalf("setsFromMsg: %v", err)
+	}
+	if !bytes.Equal(nset.DataTypeofExpr, dataTypeofCTZone) {
+		t.Errorf("round-trip DataTypeofExpr = % x, want % x", nset.DataTypeofExpr, dataTypeofCTZone)
+	}
+}
+
 // TestAddSetKeyByteOrderExplicit pins the datatype-derived KEYBYTEORDER values:
 // concat -> 0, host order -> 1, network order -> 2 (no Anonymous/Constant/Interval
 // special case).

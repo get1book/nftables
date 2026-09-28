@@ -211,6 +211,14 @@ func exprFromName(name string) Any {
 		e = &Fib{}
 	case "numgen":
 		e = &Numgen{}
+	case "fwd":
+		e = &Fwd{}
+	case "osf":
+		e = &OSF{}
+	case "tunnel":
+		e = &Tunnel{}
+	case "inner":
+		e = &Inner{}
 	}
 	return e
 }

@@ -52,6 +52,12 @@ const (
 	NFTNL_UDATA_SET_ELEM_FLAGS
 )
 
+// Object userdata types
+// https://git.netfilter.org/libnftnl/tree/include/libnftnl/udata.h#n39
+const (
+	NFTNL_UDATA_OBJ_COMMENT Type = iota
+)
+
 // Set element userdata flags
 // https://git.netfilter.org/libnftnl/tree/include/libnftnl/udata.h?id=d36691a4ac486857fd437d3a9aa3701a073a9539#n71
 const (

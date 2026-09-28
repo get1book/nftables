@@ -31,6 +31,12 @@ const (
 	PayloadBaseLLHeader        PayloadBase = unix.NFT_PAYLOAD_LL_HEADER
 	PayloadBaseNetworkHeader   PayloadBase = unix.NFT_PAYLOAD_NETWORK_HEADER
 	PayloadBaseTransportHeader PayloadBase = unix.NFT_PAYLOAD_TRANSPORT_HEADER
+	// 下面两个是**隧道内层**的基址，只在 expr.Inner 包裹里用：
+	//   PayloadBaseInnerHeader（3）= 内层任意头（nft 打印成 inner header）
+	//   PayloadBaseTunHeader（4）  = 隧道头本身（nft 打印成 tunnel header）
+	// 实测 `vxlan vni` 的内层载荷就是 `@ tunnel header + 4`。
+	PayloadBaseInnerHeader PayloadBase = unix.NFT_PAYLOAD_INNER_HEADER
+	PayloadBaseTunHeader   PayloadBase = unix.NFT_PAYLOAD_TUN_HEADER
 )
 
 // Possible PayloadCsumType values.
