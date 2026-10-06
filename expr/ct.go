@@ -90,10 +90,16 @@ const (
 )
 
 // https://git.netfilter.org/libnftnl/tree/src/obj/ct_timeout.c?id=116e95aa7b6358c917de8c69f6f173874030b46b#n38
+//
+// 这张表是「读回时拿来跟内核值比、相同就不显示」的基准，所以必须等于内核建对象时
+// 实际填进去的默认值，否则界面上会冒出一堆用户没设过的项。两个值实测校正过
+// （内核 7.2.6：nft add ct timeout ip T x { protocol tcp; } 之后 nft list 显示
+// policy = { }，而内核回读给的 established 是 432000 = sysctl 的 5 天）：
+// established 43200→432000、udp replied 180→120。
 var CtStateTCPTimeoutDefaults CtStatePolicyTimeout = map[uint16]uint32{
 	CtStateTCPSYNSENT:     120,
 	CtStateTCPSYNRECV:     60,
-	CtStateTCPESTABLISHED: 43200,
+	CtStateTCPESTABLISHED: 432000,
 	CtStateTCPFINWAIT:     120,
 	CtStateTCPCLOSEWAIT:   60,
 	CtStateTCPLASTACK:     30,
@@ -119,7 +125,9 @@ const (
 // https://git.netfilter.org/libnftnl/tree/src/obj/ct_timeout.c?id=116e95aa7b6358c917de8c69f6f173874030b46b#n57
 var CtStateUDPTimeoutDefaults CtStatePolicyTimeout = map[uint16]uint32{
 	CtStateUDPUNREPLIED: 30,
-	CtStateUDPREPLIED:   180,
+	// 180 是 libnftnl 源码里的值，但内核填的是 sysctl 的
+	// nf_conntrack_udp_timeout_stream = 120（实测：新建的 udp ct timeout 里就是 120）。
+	CtStateUDPREPLIED: 120,
 }
 
 // Ct defines type for NFT connection tracking
@@ -317,7 +325,10 @@ func (c *CtExpect) marshalData(fam byte) ([]byte, error) {
 	exprData := []netlink.Attribute{
 		{Type: NFTA_CT_EXPECT_L4PROTO, Data: []byte{c.L4Proto}},
 		{Type: NFTA_CT_EXPECT_DPORT, Data: binaryutil.BigEndian.PutUint16(c.DPort)},
-		{Type: NFTA_CT_EXPECT_TIMEOUT, Data: binaryutil.BigEndian.PutUint32(c.Timeout)},
+		// timeout 是本机字节序，别照抄上面那行的 BigEndian：实测 nft 下发
+		// `add ct expectation … timeout 1m` 的属性体是 60 ea 00 00（= 60000 的本机序）。
+		// 用 BigEndian 不会报错，只会让内核存下一个 0x60EA0000 毫秒（约 18 天）的超时。
+		{Type: NFTA_CT_EXPECT_TIMEOUT, Data: binaryutil.NativeEndian.PutUint32(c.Timeout)},
 		{Type: NFTA_CT_EXPECT_SIZE, Data: []byte{c.Size}},
 	}
 
@@ -343,7 +354,10 @@ func (c *CtExpect) unmarshal(fam byte, data []byte) error {
 		case NFTA_CT_EXPECT_DPORT:
 			c.DPort = ad.Uint16()
 		case NFTA_CT_EXPECT_TIMEOUT:
+			// 见 marshalData：这一块的整数字段里只有 timeout 是本机序。
+			ad.ByteOrder = binary.NativeEndian
 			c.Timeout = ad.Uint32()
+			ad.ByteOrder = binary.BigEndian
 		case NFTA_CT_EXPECT_SIZE:
 			c.Size = ad.Uint8()
 		}
@@ -389,7 +403,13 @@ func (c *CtTimeout) policyOrDefault() CtStatePolicyTimeout {
 }
 
 func (c *CtTimeout) marshalData(fam byte) ([]byte, error) {
-	policy := c.policyOrDefault()
+	// 只发调用方显式指定的状态：没发的那几项由内核按**建对象当时的 sysctl 默认值**填满
+	// （实测：空 policy 建出来的对象 established = 432000 = nf_conntrack_tcp_timeout_established），
+	// nft 也是这么发的（policy = { close_wait: 7 } 就只发这一项）。
+	//
+	// 这里早先是把 CtState*TimeoutDefaults 整表发下去，等于把 established 从系统的
+	// 5 天静默改成常量表里的 12h——「只填要改的状态，其余沿用内核默认」就成了假话。
+	policy := c.Policy
 
 	var policyAttrs []netlink.Attribute
 	for k, v := range policy {

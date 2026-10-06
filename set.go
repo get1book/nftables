@@ -565,6 +565,14 @@ func (cc *Conn) marshalSetElement(s *Set, e *SetElement) ([]byte, error) {
 		// Set has Timeout flag set, which means an individual element can specify its own timeout.
 		item = append(item, netlink.Attribute{Type: unix.NFTA_SET_ELEM_TIMEOUT, Data: binaryutil.BigEndian.PutUint64(uint64(e.Timeout.Milliseconds()))})
 	}
+	if e.Expires != 0 {
+		// 剩余超时（nft 语法里的 expires），大端 u64 毫秒——与解码侧
+		// NFTA_SET_ELEM_EXPIRATION 用的是同一套字节序。
+		//
+		// 内核要求元素同时给出超时（元素自己的 timeout，或集合的默认 timeout），
+		// 否则 EOPNOTSUPP；expires 大于 timeout 则是 ERANGE（两条都实测过）。
+		item = append(item, netlink.Attribute{Type: unix.NFTA_SET_ELEM_EXPIRATION, Data: binaryutil.BigEndian.PutUint64(uint64(e.Expires.Milliseconds()))})
+	}
 	// The following switch statement deal with 3 different types of elements.
 	// 1. v is an element of vmap
 	// 2. v is an element of a regular map

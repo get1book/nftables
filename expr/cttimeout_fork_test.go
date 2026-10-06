@@ -28,7 +28,7 @@ import (
 // object with a custom policy permanently changed the defaults for every later
 // object in the same process.
 func TestCtTimeoutDoesNotMutateDefaults(t *testing.T) {
-	const wantEstablished = uint32(43200)
+	const wantEstablished = uint32(432000)
 	const wantCloseWait = uint32(60)
 	if got := CtStateTCPTimeoutDefaults[CtStateTCPESTABLISHED]; got != wantEstablished {
 		t.Fatalf("precondition: default established = %d, want %d", got, wantEstablished)

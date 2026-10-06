@@ -64,6 +64,9 @@ func (e *Dup) unmarshal(fam byte, data []byte) error {
 			e.RegAddr = ad.Uint32()
 		case unix.NFTA_DUP_SREG_DEV:
 			e.RegDev = ad.Uint32()
+			// 不置位的话，`dup … device X` 回读后 IsRegDevSet=false，
+			// 与原规则的指纹不等 → 对账永远判漂移（原样写回时还会丢掉 device）。
+			e.IsRegDevSet = true
 		}
 	}
 	return ad.Err()
