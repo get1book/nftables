@@ -41,6 +41,15 @@ type Queue struct {
 	Num   uint16
 	Total uint16
 	Flag  QueueFlag
+	// SregQnum 非 0 表示队列号来自**寄存器**（`queue to <键> map { … }`）。
+	// 内核属性是 NFTA_QUEUE_SREG_QNUM（u32 寄存器号），与 NUM/TOTAL **互斥**：
+	// 上游库只会发 NUM/TOTAL/FLAGS，表达不了这种形态，所以此前一律走 tier2 降级。
+	// 真机（nft 1.1.7 `--debug=netlink`，内核 7.2.6）：
+	//   `queue to tcp dport map { 80 : 1 }` → [lookup reg 1 … dreg 1][queue sreg_qnum 1]
+	//   `queue flags bypass to …`            → [queue sreg_qnum 1 bypass]
+	// 寄存器里是 **16 位主机序**的队列号（nft 的 stmt_evaluate_queue 用
+	// integer_type / 16 bits / BYTEORDER_HOST_ENDIAN）。
+	SregQnum uint32
 }
 
 func (e *Queue) marshal(fam byte) ([]byte, error) {
@@ -55,6 +64,19 @@ func (e *Queue) marshal(fam byte) ([]byte, error) {
 }
 
 func (e *Queue) marshalData(fam byte) ([]byte, error) {
+	// 队列号来自寄存器时只发 SREG_QNUM（+ FLAGS）：内核的 nft_queue_init 走的是
+	// 「要么 NUM/TOTAL，要么 SREG_QNUM」两条互斥分支，同时带会被拒/语义不明。
+	// nft 自己也是这么发的（真机 `queue sreg_qnum 1 bypass`）。
+	if e.SregQnum != 0 {
+		attrs := []netlink.Attribute{
+			{Type: unix.NFTA_QUEUE_SREG_QNUM, Data: binaryutil.BigEndian.PutUint32(e.SregQnum)},
+		}
+		if e.Flag != 0 {
+			attrs = append(attrs, netlink.Attribute{Type: unix.NFTA_QUEUE_FLAGS,
+				Data: binaryutil.BigEndian.PutUint16(uint16(e.Flag))})
+		}
+		return netlink.MarshalAttributes(attrs)
+	}
 	if e.Total == 0 {
 		e.Total = 1 // The total default value is 1
 	}
@@ -79,6 +101,10 @@ func (e *Queue) unmarshal(fam byte, data []byte) error {
 			e.Total = ad.Uint16()
 		case unix.NFTA_QUEUE_FLAGS:
 			e.Flag = QueueFlag(ad.Uint16())
+		case unix.NFTA_QUEUE_SREG_QNUM:
+			// `queue to <键> map {…}`：内核只发这一个寄存器属性，没有 NUM/TOTAL。
+			// 不读它的话回读拿到 Num=0，渲染成 `queue to 0` 并把前面的查表子句丢掉。
+			e.SregQnum = ad.Uint32()
 		}
 	}
 	return ad.Err()

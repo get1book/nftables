@@ -15,7 +15,7 @@
 package expr
 
 import (
-	"fmt"
+	"encoding/binary"
 
 	"github.com/google/nftables/binaryutil"
 	"github.com/mdlayher/netlink"
@@ -29,6 +29,9 @@ const (
 	RtNexthop4 RtKey = unix.NFT_RT_NEXTHOP4
 	RtNexthop6 RtKey = unix.NFT_RT_NEXTHOP6
 	RtTCPMSS   RtKey = unix.NFT_RT_TCPMSS
+	// RtXFRM 是 `rt ipsec` 的键。uapi（enum nft_rt_keys）里叫 NFT_RT_XFRM，是第 5 项；
+	// x/sys/unix 还没收录这个常量，所以按 enum 顺序钉死字面量 4 —— 换来源只改这一处。
+	RtXFRM RtKey = 4
 )
 
 type Rt struct {
@@ -55,5 +58,18 @@ func (e *Rt) marshalData(fam byte) ([]byte, error) {
 }
 
 func (e *Rt) unmarshal(fam byte, data []byte) error {
-	return fmt.Errorf("not yet implemented")
+	ad, err := netlink.NewAttributeDecoder(data)
+	if err != nil {
+		return err
+	}
+	ad.ByteOrder = binary.BigEndian
+	for ad.Next() {
+		switch ad.Type() {
+		case unix.NFTA_RT_KEY:
+			e.Key = RtKey(ad.Uint32())
+		case unix.NFTA_RT_DREG:
+			e.Register = ad.Uint32()
+		}
+	}
+	return ad.Err()
 }

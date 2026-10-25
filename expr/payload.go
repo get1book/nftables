@@ -94,16 +94,19 @@ func (e *Payload) marshalData(fam byte) ([]byte, error) {
 		netlink.Attribute{Type: unix.NFTA_PAYLOAD_LEN, Data: binaryutil.BigEndian.PutUint32(e.Len)},
 	)
 
+	// CsumFlags 不能嵌在 CsumType>0 里：nft 对 udp 写（sport/dport/checksum set）
+	// 发的是 csum_type=0 + csum_flags=1（NFT_PAYLOAD_L4CSUM_PSEUDOHDR），嵌套会让
+	// udp 改写丢掉校验和调整语义（实测内核 csum_flags 0x0 vs nft 0x1，2026-10-17）。
 	if e.CsumType > 0 {
 		attrs = append(attrs,
 			netlink.Attribute{Type: unix.NFTA_PAYLOAD_CSUM_TYPE, Data: binaryutil.BigEndian.PutUint32(uint32(e.CsumType))},
 			netlink.Attribute{Type: unix.NFTA_PAYLOAD_CSUM_OFFSET, Data: binaryutil.BigEndian.PutUint32(uint32(e.CsumOffset))},
 		)
-		if e.CsumFlags > 0 {
-			attrs = append(attrs,
-				netlink.Attribute{Type: unix.NFTA_PAYLOAD_CSUM_FLAGS, Data: binaryutil.BigEndian.PutUint32(e.CsumFlags)},
-			)
-		}
+	}
+	if e.CsumFlags > 0 {
+		attrs = append(attrs,
+			netlink.Attribute{Type: unix.NFTA_PAYLOAD_CSUM_FLAGS, Data: binaryutil.BigEndian.PutUint32(e.CsumFlags)},
+		)
 	}
 
 	return netlink.MarshalAttributes(attrs)

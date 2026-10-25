@@ -16,6 +16,7 @@ package nftables
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	"github.com/google/nftables/binaryutil"
@@ -27,6 +28,11 @@ import (
 
 var (
 	newRuleHeaderType = nftMsgNewRule.HeaderType()
+
+	// ErrRuleNotFound 表示按 handle 查规则时内核里没有这一条（查不到时内核
+	// 可能回 ENOENT，也可能回一条空结果）。调用方用 errors.Is 判断，不要
+	// 匹配错误文本 —— 文案改一个字就会把 404 变成 500。
+	ErrRuleNotFound = errors.New("nftables: rule not found")
 )
 
 // This constant is missing at unix.NFTA_RULE_POSITION_ID.
@@ -85,6 +91,9 @@ func (cc *Conn) GetRuleByHandle(t *Table, c *Chain, handle uint64) (*Rule, error
 	}
 
 	if got, want := len(rules), 1; got != want {
+		if got == 0 {
+			return nil, fmt.Errorf("%w: handle %d", ErrRuleNotFound, handle)
+		}
 		return nil, fmt.Errorf("expected rule count %d, got %d", want, got)
 	}
 
@@ -112,6 +121,9 @@ func (cc *Conn) ResetRule(t *Table, c *Chain, handle uint64) (*Rule, error) {
 	}
 
 	if got, want := len(rules), 1; got != want {
+		if got == 0 {
+			return nil, fmt.Errorf("%w: handle %d", ErrRuleNotFound, handle)
+		}
 		return nil, fmt.Errorf("expected rule count %d, got %d", want, got)
 	}
 

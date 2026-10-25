@@ -224,8 +224,16 @@ func (e *Ct) unmarshal(fam byte, data []byte) error {
 		}
 	}
 
+	// 与 marshalData 的判据保持一致：这些键的方向是可选的，内核只在显式写了
+	// 方向时才回 NFTA_CT_DIRECTION。少了这几行的后果是回读把 `ct reply ip saddr`
+	// 显示成 `ct original ip saddr`（方向丢了）。
+	// **zone 必须在列**（parser_bison.y:5795-5814 里它是 ct_key_dir_optional，
+	// nft 的 netlink 消息就是 `ct load zone, dir original`），漏了它会把
+	// `ct original zone 1` 显示成 `ct zone 1`（真机 inet:244 实测）。
 	switch e.Key {
-	case CtKeyPKTS, CtKeyBYTES, CtKeyAVGPKT, CtKeyL3PROTOCOL, CtKeyPROTOCOL:
+	case CtKeyPKTS, CtKeyBYTES, CtKeyAVGPKT, CtKeyL3PROTOCOL, CtKeyPROTOCOL, CtKeyZONE,
+		CtKeySRC, CtKeyDST, CtKeyPROTOSRC, CtKeyPROTODST,
+		CtKeySRCIP, CtKeyDSTIP, CtKeySRCIP6, CtKeyDSTIP6:
 		e.OptDirection = hasDirection
 	}
 

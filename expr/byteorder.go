@@ -15,7 +15,7 @@
 package expr
 
 import (
-	"fmt"
+	"encoding/binary"
 
 	"github.com/google/nftables/binaryutil"
 	"github.com/mdlayher/netlink"
@@ -59,5 +59,24 @@ func (e *Byteorder) marshalData(fam byte) ([]byte, error) {
 }
 
 func (e *Byteorder) unmarshal(fam byte, data []byte) error {
-	return fmt.Errorf("not yet implemented")
+	ad, err := netlink.NewAttributeDecoder(data)
+	if err != nil {
+		return err
+	}
+	ad.ByteOrder = binary.BigEndian
+	for ad.Next() {
+		switch ad.Type() {
+		case unix.NFTA_BYTEORDER_SREG:
+			e.SourceRegister = ad.Uint32()
+		case unix.NFTA_BYTEORDER_DREG:
+			e.DestRegister = ad.Uint32()
+		case unix.NFTA_BYTEORDER_OP:
+			e.Op = ByteorderOp(ad.Uint32())
+		case unix.NFTA_BYTEORDER_LEN:
+			e.Len = ad.Uint32()
+		case unix.NFTA_BYTEORDER_SIZE:
+			e.Size = ad.Uint32()
+		}
+	}
+	return ad.Err()
 }

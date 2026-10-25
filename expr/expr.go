@@ -219,10 +219,20 @@ func exprFromName(name string) Any {
 		e = &Tunnel{}
 	case "inner":
 		e = &Inner{}
+	case "xfrm":
+		e = &Xfrm{}
 	case "dup":
 		// dup 的 unmarshal 早已实现（expr/dup.go），只是没登记进这张表，
 		// 导致内核回读到这里拿不到类型（返回 nil → 上层判成读回缺口）。
 		e = &Dup{}
+	case "socket":
+		e = &Socket{}
+	case "rt":
+		e = &Rt{}
+	case "tproxy":
+		e = &TProxy{}
+	case "byteorder":
+		e = &Byteorder{}
 	}
 	return e
 }

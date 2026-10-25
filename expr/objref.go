@@ -25,6 +25,12 @@ import (
 type Objref struct {
 	Type int // TODO: enum
 	Name string
+
+	// 对象 map 形态：立即对象走上面的 Type/Name；引用集合时内核给的是
+	// SREG（键所在寄存器）+ 集合名/ID，IMM_* 缺席（Type 恒为 0）。
+	SetSReg uint32
+	SetName string
+	SetID   uint32
 }
 
 func (e *Objref) marshal(fam byte) ([]byte, error) {
@@ -58,6 +64,12 @@ func (e *Objref) unmarshal(fam byte, data []byte) error {
 			e.Type = int(ad.Uint32())
 		case unix.NFTA_OBJREF_IMM_NAME:
 			e.Name = ad.String()
+		case 3: // NFTA_OBJREF_SET_SREG（x/sys 未导出）
+			e.SetSReg = ad.Uint32()
+		case 4: // NFTA_OBJREF_SET_NAME
+			e.SetName = ad.String()
+		case 5: // NFTA_OBJREF_SET_ID
+			e.SetID = ad.Uint32()
 		}
 	}
 	return ad.Err()

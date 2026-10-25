@@ -10,8 +10,10 @@
 - 上游：`github.com/google/nftables`（**Apache License 2.0**）
 - 本 fork 起始 commit：`f9b52ed2ba65`（对应上游版本
   `v0.3.1-0.20260430172505-f9b52ed2ba65`）
-- 本 fork 当前 HEAD：`5d76844`，其上是未提交的有状态对象 userdata 改动（见下）。
-  两块改动都是纯新增字段，未改动任何既有行为。
+- 本 fork 当前 HEAD：`5d76844`，其上是一批未提交改动：集合/对象 userdata、
+  表达式回读补齐（含新增 `xfrm`）、`objref` 集合形态解码、`ErrRuleNotFound` 哨兵（见下）。
+  除哨兵与 `payload` 的校验和写侧调整外，其余都是纯新增字段或把 `unmarshal` 从
+  `not yet implemented` 补成实现，未改动既有行为。
 
 ## 为什么需要这个 fork
 
@@ -92,6 +94,81 @@
 
 实测校准（nft 1.1.7 + 本 fork）：`nft list table` 能原样打印出 nftweb 写入的 comment，
 反向用 `nft add counter ... { comment "made by nft cli" }` 建的对象也能被 nftweb 读回。
+
+### 读回：`objref` 的集合形态（对象 map）
+
+`map ... { type inet_service : counter }` 这种对象映射，内核**不置** `NFT_SET_MAP`，
+值不是数据类型而是对具名对象的引用。规则里引用它时，`objref` 表达式给的是
+「键所在寄存器 + 集合名/ID」，`IMM_*` 属性整组缺席 —— 上游只解 `IMM_*`，
+于是读回来 `Type=0`、渲染不出正文。
+
+- `expr.Objref` 新增三个只读字段：`SetSReg uint32` / `SetName string` / `SetID uint32`。
+- `unmarshal` 解 `NFTA_OBJREF_SET_SREG(3)` / `NFTA_OBJREF_SET_NAME(4)` /
+  `NFTA_OBJREF_SET_ID(5)`（`golang.org/x/sys` 未导出这三个常量，按内核 uapi 硬编码）。
+- 只改读侧；写侧仍按 `IMM_TYPE`/`IMM_NAME` 走，零值不写新属性，与上游逐字节兼容。
+- 对象种类由被引用集合的 `NFTA_SET_OBJ_TYPE` 决定（见上一节 `Set.ObjType`），
+  `objref` 自身不带。
+- 涉及文件：`expr/objref.go`（本文件）。
+
+### 表达式回读补齐（byteorder / rt / tproxy / ct 方向 / payload 校验和）
+
+上游有几个表达式的 `unmarshal` 是 `not yet implemented`，还有几个的字段读错了宽度，
+表现都是「内核里有这条规则，回读正文却缺一段 / 整条失败」。共五处：
+
+- `expr/byteorder.go`：补 `unmarshal`，解 `NFTA_BYTEORDER_SREG/DREG/OP/LEN/SIZE`
+  （原来直接返回 `not yet implemented`，带字节序运算的规则回读必失败）。
+- `expr/rt.go`：补 `unmarshal`（`NFTA_RT_KEY`/`NFTA_RT_DREG`）；新增
+  `RtXFRM RtKey = 4` 表示 `rt ipsec`——`enum nft_rt_keys` 里它是第 5 项，
+  但 `golang.org/x/sys/unix` 尚未导出，按枚举顺序钉死字面量，换来源只改这一处。
+- `expr/tproxy.go`：`NFTA_TPROXY_FAMILY` 是 **u32**（`NLA_U32`），原来读成 `Uint8`，
+  内核回 `attribute 1 is not a uint8; length: 4`，整条链回读直接失败；改为
+  `byte(ad.Uint32())`。
+- `expr/ct.go`：`hasDirection` 只在方向属性真的存在时才置 `OptDirection`，但原代码
+  只给 `pkts/bytes/avgpkt/l3protocol/protocol` 这五个键开放方向，其余键即使内核
+  回了 `NFTA_CT_DIRECTION` 也被丢掉。补上 `zone/src/dst/protosrc/protodst/
+  srcip/dstip/srcip6/dstip6` 后：`ct reply ip saddr` 不再被显示成
+  `ct original ip saddr`；`ct original zone 1` 不再被压成 `ct zone 1`。
+  zone 必须在列——它是 `parser_bison.y:5795-5814` 里的 `ct_key_dir_optional`，
+  nft 发的就是 `ct load zone, dir original`（真机 inet:244 实测）。
+- `expr/payload.go`（写侧）：`NFTA_PAYLOAD_CSUM_FLAGS` 原来嵌在
+  `CsumType > 0` 分支里。nft 对 udp 改写（`udp sport/dport/checksum set`）发的是
+  `csum_type=0 + csum_flags=1`（`NFT_PAYLOAD_L4CSUM_PSEUDOHDR`），嵌在 type 里会让
+  udp 改写丢掉校验和调整语义（实测内核 `csum_flags` 0x0，nft 同规则为 0x1，
+  2026-10-17）。现在 flags 一律写在顶层。
+
+另有 `expr/expr.go` 的 `exprFromName`：表达式按名字反查类型，漏登记就返回 `nil`，
+上层只能判成「读回缺口」。补登记了 `xfrm`、`socket`、`rt`、`tproxy`、`byteorder`
+（`dup` 原本已实现，只是没登记，注释里也写明了）。
+
+涉及文件：`expr/byteorder.go`、`expr/rt.go`、`expr/tproxy.go`、`expr/ct.go`、
+`expr/payload.go`、`expr/expr.go`。
+
+### 新表达式：`xfrm`（`ipsec` 匹配）
+
+`expr/xfrm.go`（新增文件）实现 `ipsec in reqid 1` / `ipsec out spi 0x100` 的回读与写侧：
+
+- 结构 `Xfrm{Dreg, Key, Dir, Spnum}`；`NFTA_XFRM_DREG/KEY/DIR/SPNUM = 1..4`
+  （`golang.org/x/sys/unix` 未收录，就地定义）。
+- `Key` 取 `enum nft_xfrm_keys`：`reqid=5`、`spi=6`。
+- 两者字节序不同：`reqid` 走 HE 模板（主机序）、`spi` 走 BE 模板（大端）
+  ——nft `src/xfrm.c:44-45`；实测 cmp 字节 `reqid 1 → 01 00 00 00`、
+  `spi 0x100 → 00 00 01 00`。
+- 涉及文件：`expr/xfrm.go`。
+
+### 规则查询：`ErrRuleNotFound` 哨兵
+
+按 handle 查规则时，内核对「没有这一条」可能回 `ENOENT`，也可能回一条空结果。
+上游对后者只返回裸文本 `expected rule count 1, got 0`，调用方只能匹配错误文本 ——
+文案改一个字，原本的 404 就会掉进默认分支变成 422/500，且编译期没有提示。
+
+- 新增 `var ErrRuleNotFound = errors.New("nftables: rule not found")`。
+- `GetRuleByHandle` / `ResetRule` 在结果数为 0 时返回
+  `fmt.Errorf("%w: handle %d", ErrRuleNotFound, handle)`；结果数 > 1 仍用原通用报错
+  （那是真异常，不该被当成“没找到”）。
+- 调用方用 `errors.Is(err, nftables.ErrRuleNotFound)` 判断，不要匹配文本。
+- `%w` 包装可穿透多层 `fmt.Errorf`；与 `unix.ENOENT` 并列判断即可覆盖两种内核形态。
+- 涉及文件：`rule.go`（本文件）；nfapi 侧消费点是 `engine/store/reconcile.go` 的 `RuleGone`。
+
 
 ## 许可证与合规（重要）
 
